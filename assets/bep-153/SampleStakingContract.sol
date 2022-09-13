@@ -10,28 +10,33 @@ interface IStaking {
 
   function claimReward() external returns(uint256);
 
-  function claimUndeldegated() external returns(uint256);
+  function claimUndelegated() external returns(uint256);
 
   function getDelegated(address delegator, address validator) external view returns(uint256);
 
+  function getTotalDelegated(address delegator) external view returns(uint256);
+
   function getDistributedReward(address delegator) external view returns(uint256);
+
+  function getPendingRedelegateTime(address delegator, address valSrc, address valDst)  external view returns(uint256);
 
   function getUndelegated(address delegator) external view returns(uint256);
 
   function getPendingUndelegateTime(address delegator, address validator) external view returns(uint256);
 
-  function getPendingRedelegateTime(address delegator, address valSrc, address valDst) external view returns(uint256);
-
-  function getOracleRelayerFee() external view returns(uint256);
+  function getRelayerFee() external view returns(uint256);
 
   function getMinDelegation() external view returns(uint256);
+
+  function getRequestInFly(address delegator) external view returns(uint256[3] memory);
 }
 
 contract StakingDappExample {
-  bool internal locked;
+  uint8 internal locked;
 
   // constants
-  uint256 public constant TEN_DECIMALS = 10;
+  uint256 public constant LOCK_TIME = 8 days;
+  uint256 public constant TEN_DECIMALS = 1e10;
   address public constant STAKING_CONTRACT_ADDR = 0x0000000000000000000000000000000000002001;
 
   // data struct
@@ -44,6 +49,7 @@ contract StakingDappExample {
   struct UserInfo {
     uint256 amount;
     uint256 rewardDebt;
+    bool minusDebt;
     uint256 pendingUndelegated;
     uint256 undelegateUnlockTime;
   }
@@ -72,10 +78,10 @@ contract StakingDappExample {
   }
 
   modifier noReentrant() {
-    require(!locked, "No re-entrancy");
-    locked = true;
+    require(locked != 2, "No re-entrancy");
+    locked = 2;
     _;
-    locked = false;
+    locked = 1;
   }
 
   // events
@@ -87,6 +93,9 @@ contract StakingDappExample {
   event UndelegatedClaimed(address indexed delegator, uint256 amount);
   event RewardReceived(uint256 amount);
   event UndelegatedReceived(uint256 amount);
+  event AddOperator(address indexed newOperator);
+  event DelOperator(address indexed operator);
+  event TransferOwnership(address indexed newOwner);
 
   receive() external payable {}
 
@@ -96,8 +105,9 @@ contract StakingDappExample {
   }
 
   /*********************** For user **************************/
-  // This function will not always submit delegation request to the staking system contract.
-  // The delegation will be triggered when unstaked fund is greater than the minDelegationChange.
+  // This function will not submit delegation request to the staking system contract.
+  // The delegation should be called by operators manually as the proper validator need to be determined.
+  // Delegate and undelegate will also trigger claimReward.
   function delegate() external payable {
     uint256 amount = msg.value;
 
@@ -109,27 +119,20 @@ contract StakingDappExample {
       pendingReward = user.amount*poolInfo.rewardPerShare-user.rewardDebt;
     }
     user.amount = user.amount+amount;
-    user.rewardDebt = user.amount*poolInfo.rewardPerShare-pendingReward;
+    user.rewardDebt = user.amount*poolInfo.rewardPerShare;
 
     totalReceived = totalReceived+amount;
     reserveUndelegated = reserveUndelegated+amount;
-    uint256 minDelegation = IStaking(STAKING_CONTRACT_ADDR).getMinDelegation();
-    if (reserveUndelegated >= 2*minDelegation) {
-      uint256 realAmount = reserveUndelegated-minDelegation;
-      uint256 oracleRelayerFee = IStaking(STAKING_CONTRACT_ADDR).getOracleRelayerFee();
-      if (address(this).balance < realAmount+oracleRelayerFee) {
-        return;
-      }
-      realAmount = _delegate(realAmount, oracleRelayerFee);
-      totalStaked = totalStaked+realAmount;
-      reserveUndelegated = reserveUndelegated-realAmount;
-    }
 
+    if (pendingReward != 0) {
+      payable(msg.sender).transfer(pendingReward);
+    }
     emit Delegate(msg.sender, amount);
   }
 
-  // This function will not always submit delegation request to the staking system contract.
-  // The delegation will be triggered when reserve fund is less than the threshold.
+  // This function will not submit undelegation request to the staking system contract.
+  // The undelegation should be called by operators manually as the proper validator need to be determined.
+  // Delegate and undelegate will also trigger claimReward.
   function undelegate(uint256 amount) external {
     UserInfo storage user = userInfo[msg.sender];
     require(user.amount >= amount, "insufficient balance");
@@ -138,20 +141,13 @@ contract StakingDappExample {
     _updatePool();
     uint256 pendingReward = user.amount*poolInfo.rewardPerShare-user.rewardDebt;
     user.amount  = user.amount-amount;
-    user.rewardDebt = user.amount*poolInfo.rewardPerShare-pendingReward;
+    user.rewardDebt = user.amount*poolInfo.rewardPerShare;
 
     user.pendingUndelegated = user.pendingUndelegated+amount;
-    user.undelegateUnlockTime = block.timestamp+8*24*3600;
-
-    uint256 minDelegation = IStaking(STAKING_CONTRACT_ADDR).getMinDelegation();
-    if (reserveUndelegated < minDelegation) {
-      uint256 oracleRelayerFee = IStaking(STAKING_CONTRACT_ADDR).getOracleRelayerFee();
-      _undelegate(minDelegation, oracleRelayerFee);
-      totalStaked = totalStaked-minDelegation;
-      reserveUndelegated = reserveUndelegated+minDelegation;
-    }
+    user.undelegateUnlockTime = block.timestamp+LOCK_TIME;
 
     totalReceived = totalReceived-amount;
+    payable(msg.sender).transfer(pendingReward);
     emit Undelegate(msg.sender, amount);
   }
 
@@ -192,35 +188,24 @@ contract StakingDappExample {
     pendingReward = user.amount*poolInfo.rewardPerShare-user.rewardDebt;
   }
 
-  /************************** Internal **************************/
-  function _getHighestYieldingValidator() internal pure returns(uint160 highestYieldingValidator) {
-    // this function should return the desirable validator to delegate to
-    // need to be implemented by the developer
-    // use uint160 rather than address to prevent checksum error
-    highestYieldingValidator = uint160(0x001);
-  }
+  function _delegate(address validator, uint256 amount, uint256 relayerFee) public payable {
+    require(amount%TEN_DECIMALS == 0, "precision loss");
+    require(address(this).balance >= relayerFee, "insufficient funds");
+    IStaking(STAKING_CONTRACT_ADDR).delegate{value: amount+relayerFee}(validator, amount);
 
-  function _getLowestYieldingValidator() internal pure returns(uint160 lowestYieldingValidator) {
-    // this function should return the desirable validator to undelegate from
-    // need to be implemented by the developer
-    // use uint160 rather than address to prevent checksum error
-    lowestYieldingValidator = uint160(0x002);
-  }
-
-  function _delegate(uint256 amount, uint256 oracleRelayerFee) internal returns(uint256) {
-    address validator = address(_getHighestYieldingValidator());
-    amount -= amount%TEN_DECIMALS;
-    IStaking(STAKING_CONTRACT_ADDR).delegate{value: amount+oracleRelayerFee}(validator, amount);
+    totalStaked = totalStaked+amount;
+    reserveUndelegated = reserveUndelegated-amount;
     emit DelegateSubmitted(validator, amount);
-    return amount;
   }
 
-  function _undelegate(uint256 amount, uint256 oracleRelayerFee) internal returns(uint256) {
-    address validator = address(_getLowestYieldingValidator());
-    amount -= amount%TEN_DECIMALS;
-    IStaking(STAKING_CONTRACT_ADDR).undelegate{value: oracleRelayerFee}(validator, amount);
+  function _undelegate(address validator, uint256 amount, uint256 relayerFee) public payable {
+    require(amount%TEN_DECIMALS == 0, "precision loss");
+    require(address(this).balance >= relayerFee, "insufficient funds");
+    IStaking(STAKING_CONTRACT_ADDR).undelegate{value: relayerFee}(validator, amount);
+
+    totalStaked = totalStaked-amount;
+    reserveUndelegated = reserveUndelegated+amount;
     emit UndelegateSubmitted(validator, amount);
-    return amount;
   }
 
   function _claimReward() internal {
@@ -231,7 +216,7 @@ contract StakingDappExample {
   }
 
   function _claimUndelegated() internal {
-    uint256 amount = IStaking(STAKING_CONTRACT_ADDR).claimUndeldegated();
+    uint256 amount = IStaking(STAKING_CONTRACT_ADDR).claimUndelegated();
     emit UndelegatedReceived(amount);
   }
 
@@ -250,39 +235,46 @@ contract StakingDappExample {
 
   /*********************** Handle faliure **************************/
   // This parts of functions should be called by the operator when failed event detected by the monitor
-  function handleFailedDelegate(uint256 amount) external onlyOperator {
+  function handleFailedDelegate(address validator, uint256 amount) external onlyOperator {
     totalStaked = totalStaked-amount;
     reserveUndelegated = reserveUndelegated+amount;
 
-    amount = IStaking(STAKING_CONTRACT_ADDR).claimUndeldegated();
-    uint256 oracleRelayerFee = IStaking(STAKING_CONTRACT_ADDR).getOracleRelayerFee();
-    require(address(this).balance > amount+oracleRelayerFee, "insufficient balance");
-    amount = _delegate(amount, oracleRelayerFee);
+    amount = IStaking(STAKING_CONTRACT_ADDR).claimUndelegated();
+    uint256 relayerFee = IStaking(STAKING_CONTRACT_ADDR).getRelayerFee();
+    amount -= amount%TEN_DECIMALS;
+    require(address(this).balance > amount+relayerFee, "insufficient balance");
+    _delegate(validator, amount, relayerFee);
     totalStaked = totalStaked+amount;
     reserveUndelegated = reserveUndelegated-amount;
   }
 
-  function handleFailedUndelegate(uint256 amount) external onlyOperator {
+  function handleFailedUndelegate(address validator, uint256 amount) external onlyOperator {
     totalStaked = totalStaked+amount;
     reserveUndelegated = reserveUndelegated-amount;
 
-    uint256 oracleRelayerFee = IStaking(STAKING_CONTRACT_ADDR).getOracleRelayerFee();
-    require(address(this).balance > oracleRelayerFee, "insufficient balance");
-    amount = _undelegate(amount, oracleRelayerFee);
+    uint256 relayerFee = IStaking(STAKING_CONTRACT_ADDR).getRelayerFee();
+    amount -= amount%TEN_DECIMALS;
+    require(address(this).balance > relayerFee, "insufficient balance");
+    _undelegate(validator, amount, relayerFee);
     totalStaked = totalStaked-amount;
     reserveUndelegated = reserveUndelegated+amount;
   }
 
   /*********************** Params update **************************/
   function transferOwnership(address newOwner) external onlyOwner {
+    require(newOwner != address(0), "invalid address");
     owner = newOwner;
+    emit TransferOwnership(newOwner);
   }
 
   function addOperator(address opt) external onlyOwner {
+    require(opt != address(0), "invalid address");
     operators[opt] = true;
+    emit AddOperator(opt);
   }
 
   function delOperator(address opt) external onlyOwner {
     operators[opt] = false;
+    emit DelOperator(opt);
   }
 }
