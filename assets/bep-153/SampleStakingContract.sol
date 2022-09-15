@@ -115,7 +115,7 @@ contract StakingDappExample {
     UserInfo storage user = userInfo[msg.sender];
     _updatePool();
     uint256 pendingReward;
-    if (user.amount > 0) {
+    if (user.amount != 0) {
       pendingReward = user.amount*poolInfo.rewardPerShare-user.rewardDebt;
     }
     user.amount = user.amount+amount;
@@ -157,7 +157,7 @@ contract StakingDappExample {
 
   function claimReward() external noReentrant {
     UserInfo storage user = userInfo[msg.sender];
-    require(user.amount > 0, "no delegation");
+    require(user.amount != 0, "no delegation");
 
     _updatePool();
     uint256 pendingReward = user.amount*poolInfo.rewardPerShare-user.rewardDebt;
@@ -165,21 +165,23 @@ contract StakingDappExample {
       _claimReward();
     }
     user.rewardDebt = user.amount*poolInfo.rewardPerShare;
+    reserveReward -= pendingReward;
     payable(msg.sender).transfer(pendingReward);
     emit RewardClaimed(msg.sender, pendingReward);
   }
 
   function claimUndelegated() external noReentrant {
     UserInfo storage user = userInfo[msg.sender];
-    require((user.pendingUndelegated > 0) && (block.timestamp > user.undelegateUnlockTime), "no undelegated funds");
+    require((user.pendingUndelegated != 0) && (block.timestamp > user.undelegateUnlockTime), "no undelegated funds");
 
     if (reserveUndelegated < user.pendingUndelegated) {
       _claimUndelegated();
     }
     reserveUndelegated = reserveUndelegated-user.pendingUndelegated;
     totalReceived = totalReceived-user.pendingUndelegated;
+    uint256 amount = user.pendingUndelegated;
     user.pendingUndelegated = 0;
-    payable(msg.sender).transfer(user.pendingUndelegated);
+    payable(msg.sender).transfer(amount);
     emit UndelegatedClaimed(msg.sender, user.pendingUndelegated);
   }
 
